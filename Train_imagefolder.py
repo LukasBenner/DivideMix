@@ -44,8 +44,6 @@ torch.cuda.manual_seed_all(args.seed)
 gpu_train_transforms = transforms.Compose([
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(degrees=(-45,45)),
-    transforms.GaussianBlur(kernel_size=(5,9), sigma=(0.1,5)),
     transforms.ToDtype(torch.float32, scale=True),
     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ])
@@ -194,7 +192,6 @@ def eval_train(model, all_loss):
     with torch.no_grad():
         for batch_idx, (inputs, targets, index) in enumerate(eval_loader):
             inputs, targets = inputs.cuda(), targets.cuda()
-            inputs = gpu_train_transforms(inputs)
             outputs = model(inputs)
             loss = CE(outputs, targets)
             for b in range(inputs.size(0)):
