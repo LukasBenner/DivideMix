@@ -1,6 +1,7 @@
 from __future__ import print_function
 import sys
 import os
+import logging
 import argparse
 import random
 import torchvision.transforms.v2 as transforms
@@ -13,6 +14,7 @@ import torch.backends.cudnn as cudnn
 from MobileNetSmall import mobilenet_small
 from sklearn.mixture import GaussianMixture
 import dataloader_imagefolder as dataloader
+from datetime import datetime, timezone
 
 
 parser = argparse.ArgumentParser(description='DivideMix ImageFolder Training')
@@ -36,6 +38,28 @@ parser.add_argument('--id', default='imagefolder', type=str)
 args = parser.parse_args()
 
 
+timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ')
+run_id = f'{args.id}_{timestamp}'
+
+# Setup logging
+os.makedirs('checkpoint', exist_ok=True)
+log_file = os.path.join('checkpoint', f'{run_id}_run.log')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, mode='w'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('DivideMix')
+logger.info('Starting DivideMix training')
+
+# Log all arguments
+for arg, value in vars(args).items():
+    logger.info(f'ARG {arg}: {value}')
+
+
 torch.cuda.set_device(args.gpuid)
 random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -55,6 +79,9 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
 
     unlabeled_train_iter = iter(unlabeled_trainloader)
     num_iter = (len(labeled_trainloader.dataset) // args.batch_size) + 1
+    running_loss = 0.0
+    running_loss_x = 0.0
+    running_loss_u = 0.0
     for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(labeled_trainloader):
         try:
             inputs_u, inputs_u2 = next(unlabeled_train_iter)
@@ -133,17 +160,17 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
         loss.backward()
         optimizer.step()
 
-        sys.stdout.write('\r')
-        sys.stdout.write(
-            '%s | Epoch [%3d/%3d] Iter[%4d/%4d]\t Labeled loss: %.2f  Unlabeled loss: %.2f'
-            % (args.id, epoch, args.num_epochs, batch_idx + 1, num_iter, Lx.item(), Lu.item())
-        )
-        sys.stdout.flush()
+        running_loss += loss.item()
+        running_loss_x += Lx.item()
+        running_loss_u += Lu.item()
+    
+    logger.info(f'Epoch {epoch} - Loss: {running_loss / num_iter:.4f} - Lx: {running_loss_x / num_iter:.4f} - Lu: {running_loss_u / num_iter:.4f}')
 
 
 def warmup(epoch, net, optimizer, dataloader):
     net.train()
     num_iter = (len(dataloader.dataset) // dataloader.batch_size) + 1
+    running_loss = 0.0
     for batch_idx, (inputs, labels, index) in enumerate(dataloader):
         inputs, labels = inputs.cuda(), labels.cuda()
         inputs = gpu_train_transforms(inputs)
@@ -158,12 +185,9 @@ def warmup(epoch, net, optimizer, dataloader):
         L.backward()
         optimizer.step()
 
-        sys.stdout.write('\r')
-        sys.stdout.write(
-            '%s | Warmup Epoch [%3d/%3d] Iter[%4d/%4d]\t CE-loss: %.4f'
-            % (args.id, epoch, args.num_epochs, batch_idx + 1, num_iter, loss.item())
-        )
-        sys.stdout.flush()
+        running_loss += loss.item()
+
+    logger.info(f'Epoch {epoch} - Warmup Loss: {running_loss / num_iter:.4f}')
 
 
 def evaluate(net1, net2, loader, tag):
@@ -182,7 +206,7 @@ def evaluate(net1, net2, loader, tag):
             total += targets.size(0)
             correct += predicted.eq(targets).cpu().sum().item()
     acc = 100.0 * correct / total
-    print('\n| %s Accuracy: %.2f%%\n' % (tag, acc))
+    logger.info('%s Accuracy: %.2f%%' % (tag, acc))
     return acc
 
 
@@ -232,10 +256,8 @@ def create_model():
     return model
 
 
-os.makedirs('checkpoint', exist_ok=True)
-stats_log = open('./checkpoint/%s_stats.txt' % args.id, 'w')
+stats_log = open('./checkpoint/%s_stats.txt' % run_id, 'w')
 
-print('| Building net')
 net1 = create_model()
 net2 = create_model()
 cudnn.benchmark = True
@@ -275,9 +297,7 @@ for epoch in range(args.num_epochs + 1):
 
     if epoch < args.warm_up:
         warmup_trainloader = loader.run('warmup')
-        print('Warmup Net1')
         warmup(epoch, net1, optimizer1, warmup_trainloader)
-        print('\nWarmup Net2')
         warmup(epoch, net2, optimizer2, warmup_trainloader)
     else:
         prob1, all_loss[0] = eval_train(net1, all_loss[0])
@@ -286,11 +306,9 @@ for epoch in range(args.num_epochs + 1):
         pred1 = prob1 > args.p_threshold
         pred2 = prob2 > args.p_threshold
 
-        print('Train Net1')
         labeled_trainloader, unlabeled_trainloader = loader.run('train', pred2, prob2)
         train(epoch, net1, net2, optimizer1, labeled_trainloader, unlabeled_trainloader)
 
-        print('\nTrain Net2')
         labeled_trainloader, unlabeled_trainloader = loader.run('train', pred1, prob1)
         train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader)
 
