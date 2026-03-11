@@ -19,6 +19,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torchvision.transforms.v2 as transforms
+import torchvision.datasets as datasets
 from sklearn.mixture import GaussianMixture
 
 import optuna
@@ -286,7 +287,7 @@ def train(
         pred_mean = torch.softmax(logits, dim=1).mean(0)
         penalty = torch.sum(prior * torch.log(prior / pred_mean))
 
-        loss = Lx + lamb * Lu + penalty
+        loss = Lx + lamb * Lu # + penalty
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -521,7 +522,7 @@ def evaluate(
 # -------------------------
 # Train run (single config) / Optuna hook
 # -------------------------
-def train_one_run(hparams: Dict[str, Any], base_args: argparse.Namespace, run_root: str, trial: Optional[optuna.Trial] = None) -> float:
+def train_one_run(hparams: Dict[str, Any], base_args: argparse.Namespace, run_root: str, trial: Optional[optuna.Trial] = None) -> Dict[str, Any]:
     import copy
 
     args = copy.deepcopy(base_args)
@@ -593,6 +594,8 @@ def train_one_run(hparams: Dict[str, Any], base_args: argparse.Namespace, run_ro
         log=stats_log,
     )
 
+    train_targets = datasets.ImageFolder(args.train_dir).targets  # type: ignore[attr-defined]
+
     all_loss = [[], []]
 
     best_score = -1.0
@@ -627,6 +630,21 @@ def train_one_run(hparams: Dict[str, Any], base_args: argparse.Namespace, run_ro
             prob2, all_loss[1] = eval_train(net2, eval_loader, ce_per_sample, all_loss[1])
 
             pred1 = prob1 > args.p_threshold
+
+            # overall labeled fraction
+            print("labeled%:", pred1.mean())
+
+            # per-class labeled fraction (using current dataset labels from ImageFolder)
+            # you can access labels via datasets.ImageFolder(train_dir).targets once
+            # e.g. precompute train_targets (list of ints) in main
+            import numpy as np
+            train_targets_np = np.array(train_targets)
+            for c in range(args.num_class):
+                idx = (train_targets_np == c)
+                if idx.sum() > 0:
+                    print(c, "count", idx.sum(), "labeled%", pred1[idx].mean())
+
+
             pred2 = prob2 > args.p_threshold
 
             labeled_trainloader, unlabeled_trainloader = loader.run("train", pred2, prob2)
@@ -665,8 +683,29 @@ def train_one_run(hparams: Dict[str, Any], base_args: argparse.Namespace, run_ro
 
     logger.info(f"Run finished. Best {args.primary_metric}={best_score:.4f} @ epoch {best_epoch}")
 
+    # --- test evaluation (load best checkpoint if available) ---
+    test_metrics: Optional[Dict[str, float]] = None
+    if args.test_dir:
+        best_net1_path = os.path.join(ckpt_dir, "net1_best.pth")
+        best_net2_path = os.path.join(ckpt_dir, "net2_best.pth")
+        if os.path.isfile(best_net1_path) and os.path.isfile(best_net2_path):
+            logger.info("Loading best checkpoints for test evaluation...")
+            net1.load_state_dict(torch.load(best_net1_path, weights_only=True))
+            net2.load_state_dict(torch.load(best_net2_path, weights_only=True))
+        else:
+            logger.warning("No best checkpoint found, testing with final model weights.")
+
+        test_loader = loader.run("test")
+        test_metrics = evaluate(net1, net2, test_loader, split_prefix="test/", args=args, logger=logger)
+        logger.info(f"Test {args.primary_metric}={test_metrics.get(f'test/{args.primary_metric}', 0.0):.4f}")
+
     stats_log.close()
-    return float(best_score)
+    return {
+        "best_score": float(best_score),
+        "best_epoch": int(best_epoch),
+        "run_dir": run_dir,
+        "test_metrics": test_metrics,
+    }
 
 
 # -------------------------
@@ -729,7 +768,7 @@ def run_optuna(args: argparse.Namespace, base_logger: logging.Logger, run_root: 
             "momentum": trial.suggest_float("momentum", 0.8, 0.95),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 5e-3, log=True),
         }
-        return train_one_run(hparams, args, run_root, trial=trial)
+        return train_one_run(hparams, args, run_root, trial=trial)["best_score"]
 
     timeout = None if args.optuna_timeout <= 0 else int(args.optuna_timeout)
     study.optimize(objective, n_trials=int(args.optuna_trials), timeout=timeout, n_jobs=int(args.optuna_n_jobs))
@@ -766,7 +805,7 @@ def run_grid(args: argparse.Namespace, base_logger: logging.Logger, run_root: st
 
     for hparam_values in product(*values):
         hparams = dict(zip(keys, hparam_values))
-        score = train_one_run(hparams, args, run_root, trial=None)
+        score = train_one_run(hparams, args, run_root, trial=None)["best_score"]
         if score > best_score:
             best_score = score
             best_hparams = hparams
